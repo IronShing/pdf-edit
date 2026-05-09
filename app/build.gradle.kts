@@ -64,17 +64,14 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.8.4")
 
     // Compose
-    implementation(platform("androidx.compose:compose-bom:2024.09.02"))
+    implementation(platform("androidx.compose:compose-bom:2024.11.00"))
     implementation("androidx.compose.ui:ui")
     implementation("androidx.compose.ui:ui-graphics")
     implementation("androidx.compose.ui:ui-tooling-preview")
     implementation("androidx.compose.material3:material3")
     implementation("androidx.compose.material:material-icons-extended")
 
-    // PDF rendering — direct PdfiumAndroid, no barteksc wrapper
-    implementation("com.github.barteksc:PdfiumAndroid:pdfium-android-1.8.2")
-
-    // PDF parsing/writing for annotations and (eventually) text edits
+    // PDF parsing / writing — annotations, outline, content-stream edits
     implementation("com.tom-roush:pdfbox-android:2.0.27.0")
 
     // Coroutines
