@@ -20,6 +20,9 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import androidx.compose.material.icons.automirrored.filled.MenuBook
 import androidx.compose.material.icons.automirrored.filled.RotateRight
+import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.Draw
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -54,6 +57,7 @@ import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
@@ -69,6 +73,14 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     var bookmarks by remember { mutableStateOf<List<PdfBookmark>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
     val rotations = remember { mutableStateMapOf<Int, Int>() }
+    /** rendered bitmap dimensions per page index, used for screen→PDF coord transform on save */
+    val renderedSizes = remember { mutableStateMapOf<Int, IntSize>() }
+    /** bump to invalidate page bitmaps after a save */
+    var renderEpoch by remember { mutableStateOf(0) }
+    /** drawing state: target page + accumulated strokes; null when in view mode */
+    var drawTarget by remember { mutableStateOf<Int?>(null) }
+    val drawSession = remember { DrawSession() }
+    var saving by remember { mutableStateOf(false) }
 
     DisposableEffect(file) {
         try {
@@ -80,10 +92,10 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
         onDispose { renderer.close() }
     }
 
-    // Bookmark loading is slow on large PDFs (PdfBox parses the whole file).
-    // Run after the renderer is open so the first page can render in parallel.
     LaunchedEffect(file) {
-        bookmarks = withContext(Dispatchers.IO) { runCatching { renderer.loadBookmarks() }.getOrDefault(emptyList()) }
+        bookmarks = withContext(Dispatchers.IO) {
+            runCatching { renderer.loadBookmarks() }.getOrDefault(emptyList())
+        }
     }
 
     val listState = rememberLazyListState()
@@ -103,27 +115,83 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                 title = {
                     Text(
                         text = if (pageCount > 0) {
-                            "${file.nameWithoutExtension.take(22)}  ·  $currentPage / $pageCount"
+                            val mode = if (drawTarget != null) "draw" else "view"
+                            "${file.nameWithoutExtension.take(20)}  ·  $currentPage / $pageCount  ·  $mode"
                         } else {
                             file.nameWithoutExtension.take(30)
                         }
                     )
                 },
                 navigationIcon = {
-                    IconButton(onClick = onClose) {
+                    IconButton(onClick = onClose, enabled = !saving) {
                         Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Close")
                     }
                 },
                 actions = {
-                    IconButton(onClick = { bookmarksOpen = true }) {
-                        Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = "Bookmarks")
-                    }
-                    IconButton(onClick = {
-                        val idx = listState.firstVisibleItemIndex
-                        val cur = rotations[idx] ?: 0
-                        rotations[idx] = (cur + 90) % 360
-                    }) {
-                        Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Rotate page")
+                    if (drawTarget == null) {
+                        IconButton(onClick = { bookmarksOpen = true }) {
+                            Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = "Bookmarks")
+                        }
+                        IconButton(onClick = {
+                            val idx = listState.firstVisibleItemIndex
+                            val cur = rotations[idx] ?: 0
+                            rotations[idx] = (cur + 90) % 360
+                        }) {
+                            Icon(Icons.AutoMirrored.Filled.RotateRight, contentDescription = "Rotate page")
+                        }
+                        IconButton(onClick = {
+                            drawSession.clear()
+                            drawTarget = listState.firstVisibleItemIndex
+                        }) {
+                            Icon(Icons.Default.Draw, contentDescription = "Draw on this page")
+                        }
+                    } else {
+                        IconButton(
+                            onClick = {
+                                drawSession.clear()
+                                drawTarget = null
+                            },
+                            enabled = !saving
+                        ) {
+                            Icon(Icons.Default.Close, contentDescription = "Cancel drawing")
+                        }
+                        IconButton(
+                            onClick = {
+                                val target = drawTarget ?: return@IconButton
+                                if (drawSession.isEmpty()) {
+                                    drawTarget = null
+                                    return@IconButton
+                                }
+                                val bitmapSize = renderedSizes[target] ?: return@IconButton
+                                saving = true
+                                scope.launch {
+                                    val outcome = withContext(Dispatchers.IO) {
+                                        runCatching {
+                                            val (pdfW, pdfH) = renderer.pagePdfSize(target)
+                                            val strokesPdf = drawSession.strokes.mapNotNull { stroke ->
+                                                if (stroke.size < 2) null
+                                                else stroke.map { p ->
+                                                    floatArrayOf(
+                                                        p.x * pdfW / bitmapSize.width,
+                                                        pdfH - (p.y * pdfH / bitmapSize.height)
+                                                    )
+                                                }
+                                            }
+                                            renderer.burnStrokesToPage(target, strokesPdf)
+                                            pageCount = renderer.pageCount
+                                        }
+                                    }
+                                    outcome.onFailure { error = it.message }
+                                    drawSession.clear()
+                                    drawTarget = null
+                                    renderEpoch++
+                                    saving = false
+                                }
+                            },
+                            enabled = !saving
+                        ) {
+                            Icon(Icons.Default.Check, contentDescription = "Save drawing")
+                        }
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
@@ -157,7 +225,8 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                             .fillMaxSize()
                             .background(Color(0xFF0A0A0A)),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
-                        contentPadding = PaddingValues(8.dp)
+                        contentPadding = PaddingValues(8.dp),
+                        userScrollEnabled = drawTarget == null
                     ) {
                         items(
                             items = (0 until pageCount).toList(),
@@ -167,7 +236,11 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                                 renderer = renderer,
                                 pageIndex = pageIndex,
                                 widthPx = pxWidth,
-                                rotation = rotations[pageIndex] ?: 0
+                                rotation = rotations[pageIndex] ?: 0,
+                                renderEpoch = renderEpoch,
+                                drawing = drawTarget == pageIndex,
+                                drawSession = drawSession,
+                                onRendered = { size -> renderedSizes[pageIndex] = size }
                             )
                         }
                     }
@@ -185,6 +258,16 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                                 modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp),
                                 style = MaterialTheme.typography.labelMedium
                             )
+                        }
+                    }
+                    if (saving) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxSize()
+                                .background(Color(0xAA000000)),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            CircularProgressIndicator()
                         }
                     }
                 }
@@ -251,11 +334,17 @@ private fun PageView(
     renderer: PdfRenderer,
     pageIndex: Int,
     widthPx: Int,
-    rotation: Int
+    rotation: Int,
+    renderEpoch: Int,
+    drawing: Boolean,
+    drawSession: DrawSession,
+    onRendered: (IntSize) -> Unit
 ) {
-    var bitmap by remember(pageIndex, widthPx, rotation) { mutableStateOf<Bitmap?>(null) }
+    var bitmap by remember(pageIndex, widthPx, rotation, renderEpoch) {
+        mutableStateOf<Bitmap?>(null)
+    }
 
-    LaunchedEffect(pageIndex, widthPx, rotation) {
+    LaunchedEffect(pageIndex, widthPx, rotation, renderEpoch) {
         bitmap = withContext(Dispatchers.IO) { renderer.renderPage(pageIndex, widthPx, rotation) }
     }
 
@@ -270,56 +359,69 @@ private fun PageView(
             CircularProgressIndicator(modifier = Modifier.padding(32.dp))
         }
     } else {
+        LaunchedEffect(bmp.width, bmp.height) {
+            onRendered(IntSize(bmp.width, bmp.height))
+        }
         var scale by remember(pageIndex) { mutableStateOf(1f) }
         var offsetX by remember(pageIndex) { mutableStateOf(0f) }
         var offsetY by remember(pageIndex) { mutableStateOf(0f) }
 
-        Image(
-            bitmap = bmp.asImageBitmap(),
-            contentDescription = "Page ${pageIndex + 1}",
-            modifier = Modifier
-                .fillMaxWidth()
-                .graphicsLayer(
-                    scaleX = scale,
-                    scaleY = scale,
-                    translationX = offsetX,
-                    translationY = offsetY
-                )
-                .pointerInput(pageIndex) {
-                    awaitEachGesture {
-                        awaitFirstDown(requireUnconsumed = false)
-                        do {
-                            val event = awaitPointerEvent()
-                            val pressed = event.changes.count { it.pressed }
-                            when {
-                                pressed >= 2 -> {
-                                    val zoomChange = event.calculateZoom()
-                                    val panChange = event.calculatePan()
-                                    if (zoomChange != 1f) {
-                                        scale = (scale * zoomChange).coerceIn(1f, 6f)
-                                        if (scale == 1f) {
-                                            offsetX = 0f; offsetY = 0f
+        Box(modifier = Modifier.fillMaxWidth()) {
+            Image(
+                bitmap = bmp.asImageBitmap(),
+                contentDescription = "Page ${pageIndex + 1}",
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .graphicsLayer(
+                        scaleX = scale,
+                        scaleY = scale,
+                        translationX = offsetX,
+                        translationY = offsetY
+                    )
+                    .then(
+                        if (drawing) Modifier
+                        else Modifier.pointerInput(pageIndex) {
+                            awaitEachGesture {
+                                awaitFirstDown(requireUnconsumed = false)
+                                do {
+                                    val event = awaitPointerEvent()
+                                    val pressed = event.changes.count { it.pressed }
+                                    when {
+                                        pressed >= 2 -> {
+                                            val zoomChange = event.calculateZoom()
+                                            val panChange = event.calculatePan()
+                                            if (zoomChange != 1f) {
+                                                scale = (scale * zoomChange).coerceIn(1f, 6f)
+                                                if (scale == 1f) {
+                                                    offsetX = 0f; offsetY = 0f
+                                                }
+                                            }
+                                            if (scale > 1f && panChange != Offset.Zero) {
+                                                offsetX += panChange.x
+                                                offsetY += panChange.y
+                                            }
+                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                        }
+                                        pressed == 1 && scale > 1f -> {
+                                            val panChange = event.calculatePan()
+                                            if (panChange != Offset.Zero) {
+                                                offsetX += panChange.x
+                                                offsetY += panChange.y
+                                                event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                            }
                                         }
                                     }
-                                    if (scale > 1f && panChange != Offset.Zero) {
-                                        offsetX += panChange.x
-                                        offsetY += panChange.y
-                                    }
-                                    event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                }
-                                pressed == 1 && scale > 1f -> {
-                                    val panChange = event.calculatePan()
-                                    if (panChange != Offset.Zero) {
-                                        offsetX += panChange.x
-                                        offsetY += panChange.y
-                                        event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                    }
-                                }
-                                // pressed == 1 && scale == 1: don't consume — let LazyColumn scroll
+                                } while (event.changes.any { it.pressed })
                             }
-                        } while (event.changes.any { it.pressed })
-                    }
-                }
-        )
+                        }
+                    )
+            )
+            if (drawing) {
+                DrawingOverlay(
+                    session = drawSession,
+                    modifier = Modifier.matchParentSize()
+                )
+            }
+        }
     }
 }

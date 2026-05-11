@@ -2,7 +2,7 @@
 
 An Android PDF editor — built ground-up, with the long-term goal of in-place text editing that preserves the original font (Tier 2 from the staircase below).
 
-**Status:** v0.1.0 — viewer with pinch-zoom, rotation, page indicator, bookmarks drawer.
+**Status:** v0.2.0 — viewer + freehand draw / signature, burnt into the page on save.
 
 ## Roadmap (the staircase)
 
@@ -12,7 +12,10 @@ Each step ships something usable on its own. We don't move up until the rung bel
 |---|---|---|
 | **v0.0** | Render PDFs (PdfiumAndroid), open via SAF, scroll | ✅ done |
 | **v0.1** | Pinch zoom, page indicator, bookmarks, rotation | ✅ done |
-| **v0.2** | Annotations: freehand, highlight, underline, strikethrough, sticky notes, signatures. Save back via PdfBox-Android annotation API. Undo/redo. | ⬜ |
+| **v0.2** | Annotations: freehand, highlight, underline, strikethrough, sticky notes, signatures. Save back. Undo/redo. | 🟡 in progress |
+| ↳ v0.2.0 | Freehand draw + signature, burnt into the page content stream on save | ✅ done |
+| ↳ v0.2.1 | Highlight / underline / strikethrough on existing text | ⬜ |
+| ↳ v0.2.2 | Sticky notes + undo/redo stack | ⬜ |
 | **v0.3** | Insert new text (place a new text object, choose a font from the user's font folder, write to content stream — not annotation) | ⬜ |
 | **v0.4** | Tier 2 — **edit existing text in place** with original-font preservation where possible. Detect missing fonts, prompt the user to provide them. | ⬜ |
 | **v1.0** | Vector path editing, image manipulation, multi-touch transforms (Tier 3 territory) | ⬜ |

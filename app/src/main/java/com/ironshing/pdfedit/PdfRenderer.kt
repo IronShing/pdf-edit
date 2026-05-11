@@ -7,10 +7,11 @@ import android.graphics.pdf.PdfRenderer as AndroidPdfRenderer
 import android.os.ParcelFileDescriptor
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
+import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+import com.tom_roush.pdfbox.pdmodel.interactive.action.PDActionGoTo
+import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
-import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination
-import com.tom_roush.pdfbox.pdmodel.interactive.action.PDActionGoTo
 import java.io.File
 
 data class PdfBookmark(
@@ -76,6 +77,62 @@ class PdfRenderer(private val context: android.content.Context) {
     }
 
     fun bookmarks(): List<PdfBookmark> = bookmarksCache
+
+    /** PDF-points size of [pageIndex] (1 point = 1/72 inch — same unit PdfBox uses). */
+    fun pagePdfSize(pageIndex: Int): Pair<Int, Int> {
+        val r = renderer ?: error("no document open")
+        val page = r.openPage(pageIndex)
+        try {
+            return page.width to page.height
+        } finally {
+            page.close()
+        }
+    }
+
+    /**
+     * Burn [strokesPdf] (each stroke is a list of (x, y) points already in PDF coords —
+     * origin bottom-left, points) onto [pageIndex]'s content stream. After writing the
+     * file is closed and reopened so renderPage() reflects the new content.
+     */
+    fun burnStrokesToPage(
+        pageIndex: Int,
+        strokesPdf: List<List<FloatArray>>,
+        rgb: Triple<Float, Float, Float> = Triple(0f, 0f, 0f),
+        lineWidth: Float = 2f
+    ) {
+        val file = sourceFile ?: error("no document open")
+        val wasOpen = renderer != null
+        if (wasOpen) close()
+        try {
+            PDDocument.load(file).use { doc ->
+                val page = doc.getPage(pageIndex)
+                PDPageContentStream(
+                    doc,
+                    page,
+                    PDPageContentStream.AppendMode.APPEND,
+                    true,
+                    true
+                ).use { cs ->
+                    cs.setStrokingColor(rgb.first, rgb.second, rgb.third)
+                    cs.setLineWidth(lineWidth)
+                    cs.setLineCapStyle(1) // round
+                    cs.setLineJoinStyle(1) // round
+                    for (stroke in strokesPdf) {
+                        if (stroke.size < 1) continue
+                        val first = stroke[0]
+                        cs.moveTo(first[0], first[1])
+                        for (i in 1 until stroke.size) {
+                            cs.lineTo(stroke[i][0], stroke[i][1])
+                        }
+                        cs.stroke()
+                    }
+                }
+                doc.save(file)
+            }
+        } finally {
+            if (wasOpen) open(file)
+        }
+    }
 
     private fun readBookmarks(file: File): List<PdfBookmark> {
         return try {
