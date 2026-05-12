@@ -7,6 +7,10 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.calculatePan
 import androidx.compose.foundation.gestures.calculateZoom
+import androidx.compose.foundation.gestures.detectTapGestures
+import androidx.compose.foundation.text.BasicTextField
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.PaddingValues
@@ -53,11 +57,15 @@ import androidx.compose.runtime.mutableStateMapOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
@@ -65,8 +73,12 @@ import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -80,6 +92,8 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     var pageCount by remember { mutableStateOf(0) }
     var bookmarks by remember { mutableStateOf<List<PdfBookmark>>(emptyList()) }
     var error by remember { mutableStateOf<String?>(null) }
+    /** Transient save errors — shown as a snackbar-ish overlay so the viewer stays mounted. */
+    var saveError by remember { mutableStateOf<String?>(null) }
     val rotations = remember { mutableStateMapOf<Int, Int>() }
     /** rendered bitmap dimensions per page index, used for screen→PDF coord transform on save */
     val renderedSizes = remember { mutableStateMapOf<Int, IntSize>() }
@@ -92,12 +106,12 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     /** zoom scale per page; lifted up so back-handler and re-render can react */
     val pageScales = remember { mutableStateMapOf<Int, Float>() }
     val pageOffsets = remember { mutableStateMapOf<Int, Offset>() }
-    /** text-edit mode: which page (null = view), runs found on it, currently selected run */
+    /** text-edit mode: which page (null = view), runs found on it, run being edited inline */
     var textEditTarget by remember { mutableStateOf<Int?>(null) }
     var textRuns by remember { mutableStateOf<List<TextRun>>(emptyList()) }
     var pagePdfSize by remember { mutableStateOf<Pair<Int, Int>?>(null) }
-    var editingRun by remember { mutableStateOf<TextRun?>(null) }
-    var editingDraft by remember { mutableStateOf("") }
+    var activeRun by remember { mutableStateOf<TextRun?>(null) }
+    var activeDraft by remember { mutableStateOf("") }
 
     DisposableEffect(file) {
         try {
@@ -129,9 +143,9 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     BackHandler(enabled = !saving) {
         val visible = listState.firstVisibleItemIndex
         when {
-            editingRun != null -> {
-                editingRun = null
-                editingDraft = ""
+            activeRun != null -> {
+                activeRun = null
+                activeDraft = ""
             }
             textEditTarget != null -> {
                 textEditTarget = null
@@ -146,6 +160,26 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                 pageOffsets[visible] = Offset.Zero
             }
             else -> onClose()
+        }
+    }
+
+    fun commitActiveEdit() {
+        val pending = activeRun ?: return
+        val pendingDraft = activeDraft
+        activeRun = null
+        if (pendingDraft == pending.text || pendingDraft.isEmpty()) {
+            activeDraft = ""
+            return
+        }
+        saving = true
+        scope.launch {
+            val outcome = withContext(Dispatchers.IO) {
+                runCatching { renderer.replaceText(pending, pendingDraft) }
+            }
+            outcome.onFailure { saveError = it.message ?: it.javaClass.simpleName }
+            activeDraft = ""
+            saving = false
+            renderEpoch++
         }
     }
 
@@ -261,7 +295,7 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                                             pageCount = renderer.pageCount
                                         }
                                     }
-                                    outcome.onFailure { error = it.message }
+                                    outcome.onFailure { saveError = it.message ?: it.javaClass.simpleName }
                                     drawSession.clear()
                                     drawTarget = null
                                     renderEpoch++
@@ -313,25 +347,36 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                             key = { it }
                         ) { pageIndex ->
                             val isTextTarget = textEditTarget == pageIndex
+                            // Cap bitmap render width at 720 to keep memory bounded
+                            // even on big screens — most PDFs look fine here, sharper
+                            // version kicks in when the user zooms.
+                            val cappedWidthPx = pxWidth.coerceAtMost(720)
+                            val isFocused = pageIndex == listState.firstVisibleItemIndex
                             PageView(
                                 renderer = renderer,
                                 pageIndex = pageIndex,
-                                widthPx = pxWidth,
+                                widthPx = cappedWidthPx,
                                 rotation = rotations[pageIndex] ?: 0,
                                 renderEpoch = renderEpoch,
                                 drawing = drawTarget == pageIndex,
                                 drawSession = drawSession,
-                                scale = if (isTextTarget) 1f else (pageScales[pageIndex] ?: 1f),
-                                offset = if (isTextTarget) Offset.Zero else (pageOffsets[pageIndex] ?: Offset.Zero),
+                                scrolling = listState.isScrollInProgress && !isFocused,
+                                scale = pageScales[pageIndex] ?: 1f,
+                                offset = pageOffsets[pageIndex] ?: Offset.Zero,
                                 onScaleChange = { pageScales[pageIndex] = it },
                                 onOffsetChange = { pageOffsets[pageIndex] = it },
                                 textEditing = isTextTarget,
                                 textRuns = if (isTextTarget) textRuns else emptyList(),
                                 pagePdfSize = if (isTextTarget) pagePdfSize else null,
-                                onRunTap = { run ->
-                                    editingRun = run
-                                    editingDraft = run.text
+                                activeRun = if (isTextTarget) activeRun else null,
+                                activeDraft = activeDraft,
+                                onActivateRun = { run ->
+                                    if (activeRun != null && activeRun != run) commitActiveEdit()
+                                    activeRun = run
+                                    activeDraft = run.text
                                 },
+                                onDraftChange = { activeDraft = it },
+                                onCommitEdit = { commitActiveEdit() },
                                 onRendered = { size -> renderedSizes[pageIndex] = size }
                             )
                         }
@@ -362,38 +407,30 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                             CircularProgressIndicator()
                         }
                     }
+                    saveError?.let { msg ->
+                        LaunchedEffect(msg) {
+                            kotlinx.coroutines.delay(4000)
+                            saveError = null
+                        }
+                        Surface(
+                            modifier = Modifier
+                                .align(Alignment.BottomCenter)
+                                .padding(16.dp)
+                                .fillMaxWidth(),
+                            shape = MaterialTheme.shapes.small,
+                            color = Color(0xEE5A1A1A)
+                        ) {
+                            Text(
+                                text = "Save failed: $msg",
+                                color = Color.White,
+                                modifier = Modifier.padding(12.dp),
+                                style = MaterialTheme.typography.bodySmall
+                            )
+                        }
+                    }
                 }
             }
         }
-    }
-
-    val activeRun = editingRun
-    if (activeRun != null) {
-        TextEditDialog(
-            original = activeRun,
-            draft = editingDraft,
-            onDraftChange = { editingDraft = it },
-            onCancel = {
-                editingRun = null
-                editingDraft = ""
-            },
-            onConfirm = {
-                val pending = activeRun
-                val pendingDraft = editingDraft
-                saving = true
-                editingRun = null
-                scope.launch {
-                    val outcome = withContext(Dispatchers.IO) {
-                        runCatching { renderer.replaceText(pending, pendingDraft) }
-                    }
-                    outcome.onFailure { error = it.message }
-                    editingDraft = ""
-                    saving = false
-                    renderEpoch++
-                }
-            },
-            saving = saving
-        )
     }
 
     if (bookmarksOpen) {
@@ -445,53 +482,6 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     }
 }
 
-@Composable
-private fun TextEditDialog(
-    original: TextRun,
-    draft: String,
-    onDraftChange: (String) -> Unit,
-    onCancel: () -> Unit,
-    onConfirm: () -> Unit,
-    saving: Boolean
-) {
-    AlertDialog(
-        onDismissRequest = { if (!saving) onCancel() },
-        title = { Text("Edit text") },
-        text = {
-            androidx.compose.foundation.layout.Column {
-                Text(
-                    text = "Original: ${original.text}",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-                androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(8.dp))
-                OutlinedTextField(
-                    value = draft,
-                    onValueChange = onDraftChange,
-                    modifier = Modifier.fillMaxWidth(),
-                    enabled = !saving,
-                    singleLine = true
-                )
-                androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(8.dp))
-                Text(
-                    text = "Font: ${original.fontName} · ${"%.1f".format(original.fontSize)}pt\n" +
-                            "Alpha caveat: new text is drawn in Helvetica over a white rectangle.",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
-            }
-        },
-        confirmButton = {
-            TextButton(onClick = onConfirm, enabled = !saving && draft.isNotEmpty()) {
-                Text(if (saving) "Saving..." else "Save")
-            }
-        },
-        dismissButton = {
-            TextButton(onClick = onCancel, enabled = !saving) { Text("Cancel") }
-        }
-    )
-}
-
 private data class FlatBookmark(val bookmark: PdfBookmark, val depth: Int)
 
 private fun List<PdfBookmark>.flatten(depth: Int = 0): List<FlatBookmark> =
@@ -506,6 +496,7 @@ private fun PageView(
     renderEpoch: Int,
     drawing: Boolean,
     drawSession: DrawSession,
+    scrolling: Boolean,
     scale: Float,
     offset: Offset,
     onScaleChange: (Float) -> Unit,
@@ -513,31 +504,43 @@ private fun PageView(
     textEditing: Boolean,
     textRuns: List<TextRun>,
     pagePdfSize: Pair<Int, Int>?,
-    onRunTap: (TextRun) -> Unit,
+    activeRun: TextRun?,
+    activeDraft: String,
+    onActivateRun: (TextRun) -> Unit,
+    onDraftChange: (String) -> Unit,
+    onCommitEdit: () -> Unit,
     onRendered: (IntSize) -> Unit
 ) {
-    /** integer render quality tier: 1, 2, or 4 — re-rendered at widthPx × quality on zoom settle */
-    var renderQuality by remember(pageIndex) { mutableStateOf(1) }
-    var bitmap by remember(pageIndex, widthPx, rotation, renderEpoch, renderQuality) {
+    /**
+     * Effective render width as a fraction of the screen pixel width.
+     *  0.5 = render at half width (used while scrolling — fast, mildly blurry)
+     *  1.0 = normal idle resolution
+     *  2.0 = zoomed-in resolution
+     */
+    var renderScale by remember(pageIndex) { mutableStateOf(1.0f) }
+    var bitmap by remember(pageIndex, widthPx, rotation, renderEpoch, renderScale) {
         mutableStateOf<Bitmap?>(null)
     }
 
-    LaunchedEffect(pageIndex, widthPx, rotation, renderEpoch, renderQuality) {
+    LaunchedEffect(pageIndex, widthPx, rotation, renderEpoch, renderScale) {
+        val targetWidth = (widthPx * renderScale).toInt().coerceAtLeast(1)
         bitmap = withContext(Dispatchers.IO) {
-            renderer.renderPage(pageIndex, widthPx * renderQuality, rotation)
+            renderer.renderPage(pageIndex, targetWidth, rotation)
         }
     }
 
-    // Settle the zoom level then bump render quality to the nearest integer step.
-    // Debounce so we don't re-render on every pinch frame.
-    LaunchedEffect(scale, pageIndex) {
-        kotlinx.coroutines.delay(180)
-        val target = when {
-            scale <= 1.25f -> 1
-            scale <= 2.5f -> 2
-            else -> 4
-        }
-        if (target != renderQuality) renderQuality = target
+    // Render quality strategy:
+    //  - while scrolling: don't trigger any new renders, keep whatever bitmap is
+    //    already on screen. Renders are synchronous through a lock and stale ones
+    //    can't be cancelled mid-flight, so issuing one per scroll-stop avoids
+    //    queuing up work that blocks fresh pages from rendering.
+    //  - after scroll settles + no zoom: 1× (sharp at base size)
+    //  - after zoom > 1.25× settles: 2× (sharp when zoomed)
+    LaunchedEffect(scale, pageIndex, scrolling) {
+        if (scrolling) return@LaunchedEffect
+        kotlinx.coroutines.delay(220)
+        val target = if (scale <= 1.25f) 1.0f else 2.0f
+        if (target != renderScale) renderScale = target
     }
 
     val bmp = bitmap
@@ -551,55 +554,77 @@ private fun PageView(
             CircularProgressIndicator(modifier = Modifier.padding(32.dp))
         }
     } else {
-        LaunchedEffect(bmp.width, bmp.height, renderQuality) {
-            // report the displayed bitmap size in pixels at quality=1 so PDF-coord transforms stay
-            // consistent regardless of current render quality
-            onRendered(IntSize(bmp.width / renderQuality, bmp.height / renderQuality))
+        LaunchedEffect(bmp.width, bmp.height, renderScale) {
+            // report the displayed bitmap size in screen pixels (== widthPx at renderScale=1.0),
+            // independent of current render quality, so PDF-coord transforms stay consistent
+            val factor = if (renderScale > 0f) renderScale else 1f
+            onRendered(IntSize((bmp.width / factor).toInt(), (bmp.height / factor).toInt()))
         }
 
-        Box(modifier = Modifier.fillMaxWidth()) {
+        // Only allocate an offscreen graphicsLayer when there's an actual transform —
+        // wrapping every page in a layer at identity scale is wasted GPU work.
+        // When zoomed, use the lambda form so pan updates read state in the DRAW
+        // phase instead of triggering a recomposition every finger-move frame.
+        val hasTransform = scale != 1f || offset != Offset.Zero
+        val scaleLive by rememberUpdatedState(scale)
+        val offsetLive by rememberUpdatedState(offset)
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .then(
+                    if (hasTransform) Modifier.graphicsLayer {
+                        scaleX = scaleLive
+                        scaleY = scaleLive
+                        translationX = offsetLive.x
+                        translationY = offsetLive.y
+                    } else Modifier
+                )
+        ) {
             Image(
                 bitmap = bmp.asImageBitmap(),
                 contentDescription = "Page ${pageIndex + 1}",
                 modifier = Modifier
                     .fillMaxWidth()
-                    .graphicsLayer(
-                        scaleX = scale,
-                        scaleY = scale,
-                        translationX = offset.x,
-                        translationY = offset.y
-                    )
                     .then(
                         if (drawing || textEditing) Modifier
-                        else Modifier.pointerInput(pageIndex) {
-                            awaitEachGesture {
-                                awaitFirstDown(requireUnconsumed = false)
-                                do {
-                                    val event = awaitPointerEvent()
-                                    val pressed = event.changes.count { it.pressed }
-                                    when {
-                                        pressed >= 2 -> {
-                                            val zoomChange = event.calculateZoom()
-                                            val panChange = event.calculatePan()
-                                            if (zoomChange != 1f) {
-                                                val newScale = (scale * zoomChange).coerceIn(1f, 6f)
-                                                onScaleChange(newScale)
-                                                if (newScale == 1f) onOffsetChange(Offset.Zero)
-                                            }
-                                            if (scale > 1f && panChange != Offset.Zero) {
-                                                onOffsetChange(offset + panChange)
-                                            }
-                                            event.changes.forEach { if (it.positionChanged()) it.consume() }
-                                        }
-                                        pressed == 1 && scale > 1f -> {
-                                            val panChange = event.calculatePan()
-                                            if (panChange != Offset.Zero) {
-                                                onOffsetChange(offset + panChange)
+                        else {
+                            // pointerInput captures closure values at launch time; without
+                            // rememberUpdatedState the lambda sees scale=1f forever and zoom
+                            // never accumulates.
+                            val scaleLive by rememberUpdatedState(scale)
+                            val offsetLive by rememberUpdatedState(offset)
+                            val onScaleLive by rememberUpdatedState(onScaleChange)
+                            val onOffsetLive by rememberUpdatedState(onOffsetChange)
+                            Modifier.pointerInput(pageIndex) {
+                                awaitEachGesture {
+                                    awaitFirstDown(requireUnconsumed = false)
+                                    do {
+                                        val event = awaitPointerEvent()
+                                        val pressed = event.changes.count { it.pressed }
+                                        when {
+                                            pressed >= 2 -> {
+                                                val zoomChange = event.calculateZoom()
+                                                val panChange = event.calculatePan()
+                                                if (zoomChange != 1f) {
+                                                    val newScale = (scaleLive * zoomChange).coerceIn(1f, 6f)
+                                                    onScaleLive(newScale)
+                                                    if (newScale == 1f) onOffsetLive(Offset.Zero)
+                                                }
+                                                if (scaleLive > 1f && panChange != Offset.Zero) {
+                                                    onOffsetLive(offsetLive + panChange)
+                                                }
                                                 event.changes.forEach { if (it.positionChanged()) it.consume() }
                                             }
+                                            pressed == 1 && scaleLive > 1f -> {
+                                                val panChange = event.calculatePan()
+                                                if (panChange != Offset.Zero) {
+                                                    onOffsetLive(offsetLive + panChange)
+                                                    event.changes.forEach { if (it.positionChanged()) it.consume() }
+                                                }
+                                            }
                                         }
-                                    }
-                                } while (event.changes.any { it.pressed })
+                                    } while (event.changes.any { it.pressed })
+                                }
                             }
                         }
                     )
@@ -612,32 +637,89 @@ private fun PageView(
             }
             if (textEditing && pagePdfSize != null && textRuns.isNotEmpty()) {
                 val density = LocalDensity.current
-                val bmpWidthPx = bmp.width / renderQuality
-                val bmpHeightPx = bmp.height / renderQuality
+                val factor = if (renderScale > 0f) renderScale else 1f
+                val bmpWidthPx = (bmp.width / factor).toInt()
+                val bmpHeightPx = (bmp.height / factor).toInt()
                 val (pdfW, pdfH) = pagePdfSize
                 val sx = bmpWidthPx.toFloat() / pdfW
                 val sy = bmpHeightPx.toFloat() / pdfH
-                for (run in textRuns) {
-                    val leftPx = run.x * sx
-                    val topPx = (pdfH - run.baselineY - run.height) * sy
-                    val widthPxRun = run.width * sx
-                    val heightPxRun = run.height * sy
-                    Box(
+
+                fun runScreenRect(run: TextRun): RunRect {
+                    val visualHeight = run.fontSize * 1.2f
+                    val descent = run.fontSize * 0.25f
+                    val pdfTop = run.baselineY + (visualHeight - descent)
+                    return RunRect(
+                        leftPx = run.x * sx,
+                        topPx = (pdfH - pdfTop) * sy,
+                        widthPx = run.width * sx,
+                        heightPx = visualHeight * sy
+                    )
+                }
+
+                // Full-page transparent tap layer: hit-test tap location against
+                // textRuns and activate the one under the finger. Generous vertical
+                // padding (≈ half a line) and a few pixels of horizontal slack so
+                // narrow runs (single words) don't require finger-precision taps.
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .pointerInput(textRuns) {
+                            detectTapGestures { tap ->
+                                val hit = textRuns.firstOrNull { run ->
+                                    val r = runScreenRect(run)
+                                    val padY = r.heightPx * 0.45f
+                                    val padX = 6f
+                                    tap.x in (r.leftPx - padX)..(r.leftPx + r.widthPx + padX) &&
+                                        tap.y in (r.topPx - padY)..(r.topPx + r.heightPx + padY)
+                                }
+                                if (hit != null) onActivateRun(hit) else onCommitEdit()
+                            }
+                        }
+                )
+
+                // Inline editor for the active run.
+                if (activeRun != null && activeRun.pageIndex == pageIndex) {
+                    val r = runScreenRect(activeRun)
+                    val focusRequester = remember(activeRun) { FocusRequester() }
+                    LaunchedEffect(activeRun) { focusRequester.requestFocus() }
+                    BasicTextField(
+                        value = activeDraft,
+                        onValueChange = onDraftChange,
                         modifier = Modifier
                             .offset(
-                                x = with(density) { leftPx.toDp() },
-                                y = with(density) { topPx.toDp() }
+                                x = with(density) { r.leftPx.toDp() },
+                                y = with(density) { r.topPx.toDp() }
                             )
                             .size(
-                                width = with(density) { widthPxRun.toDp() },
-                                height = with(density) { heightPxRun.toDp() }
+                                width = with(density) {
+                                    // Give the field some slack to grow as the user types
+                                    (r.widthPx * 1.5f).coerceAtLeast(r.widthPx + 80f).toDp()
+                                },
+                                height = with(density) { (r.heightPx + 8f).toDp() }
                             )
-                            .border(1.dp, Color(0x9900AAFF))
-                            .background(Color(0x3300AAFF))
-                            .clickable { onRunTap(run) }
+                            .background(Color.White)
+                            .border(1.dp, Color(0xFF2563EB))
+                            .padding(horizontal = 2.dp)
+                            .focusRequester(focusRequester),
+                        textStyle = TextStyle(
+                            color = Color.Black,
+                            fontSize = with(density) { (activeRun.fontSize * sx).toSp() },
+                            fontFamily = FontFamily.SansSerif
+                        ),
+                        cursorBrush = SolidColor(Color(0xFF2563EB)),
+                        singleLine = true,
+                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                        keyboardActions = KeyboardActions(onDone = { onCommitEdit() })
                     )
                 }
             }
         }
     }
 }
+
+private data class RunRect(
+    val leftPx: Float,
+    val topPx: Float,
+    val widthPx: Float,
+    val heightPx: Float
+)

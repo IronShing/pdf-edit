@@ -5,6 +5,7 @@ import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.pdf.PdfRenderer as AndroidPdfRenderer
 import android.os.ParcelFileDescriptor
+import android.util.Log
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
@@ -28,6 +29,13 @@ data class PdfBookmark(
  * used to extract the outline (bookmarks). Owns one open document.
  */
 class PdfRenderer(private val context: android.content.Context) {
+    /**
+     * Serializes access to the underlying AndroidPdfRenderer and the file. renderPage()
+     * on Dispatchers.IO and replaceText() / burnStrokesToPage() (which close + reopen
+     * the file under the hood) can race otherwise — and AndroidPdfRenderer throws if
+     * a Page is closed after its Document.
+     */
+    private val lock = Any()
     private var pfd: ParcelFileDescriptor? = null
     private var renderer: AndroidPdfRenderer? = null
     private var bookmarksCache: List<PdfBookmark> = emptyList()
@@ -38,8 +46,8 @@ class PdfRenderer(private val context: android.content.Context) {
 
     private var sourceFile: File? = null
 
-    fun open(file: File) {
-        close()
+    fun open(file: File) = synchronized(lock) {
+        closeLocked()
         val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
         pfd = fd
         renderer = AndroidPdfRenderer(fd)
@@ -48,20 +56,20 @@ class PdfRenderer(private val context: android.content.Context) {
     }
 
     val pageCount: Int
-        get() = renderer?.pageCount ?: 0
+        get() = synchronized(lock) { renderer?.pageCount ?: 0 }
 
     /** Parses outline via PdfBox (slow on big PDFs). Call from a background dispatcher. */
-    fun loadBookmarks(): List<PdfBookmark> {
-        val file = sourceFile ?: return emptyList()
+    fun loadBookmarks(): List<PdfBookmark> = synchronized(lock) {
+        val file = sourceFile ?: return@synchronized emptyList()
         bookmarksCache = readBookmarks(file)
-        return bookmarksCache
+        return@synchronized bookmarksCache
     }
 
     /**
      * Render [pageIndex] into a bitmap of [width] × the page's natural aspect-ratio height,
      * applying [rotationDegrees] (0/90/180/270) by post-rotating the bitmap.
      */
-    fun renderPage(pageIndex: Int, width: Int, rotationDegrees: Int = 0): Bitmap {
+    fun renderPage(pageIndex: Int, width: Int, rotationDegrees: Int = 0): Bitmap = synchronized(lock) {
         val r = renderer ?: error("no document open")
         val page = r.openPage(pageIndex)
         try {
@@ -69,11 +77,11 @@ class PdfRenderer(private val context: android.content.Context) {
             val raw = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
             raw.eraseColor(Color.WHITE)
             page.render(raw, null, null, AndroidPdfRenderer.Page.RENDER_MODE_FOR_DISPLAY)
-            if (rotationDegrees % 360 == 0) return raw
+            if (rotationDegrees % 360 == 0) return@synchronized raw
             val m = Matrix().apply { postRotate(rotationDegrees.toFloat()) }
             val rotated = Bitmap.createBitmap(raw, 0, 0, raw.width, raw.height, m, true)
             if (rotated !== raw) raw.recycle()
-            return rotated
+            return@synchronized rotated
         } finally {
             page.close()
         }
@@ -82,11 +90,11 @@ class PdfRenderer(private val context: android.content.Context) {
     fun bookmarks(): List<PdfBookmark> = bookmarksCache
 
     /** PDF-points size of [pageIndex] (1 point = 1/72 inch — same unit PdfBox uses). */
-    fun pagePdfSize(pageIndex: Int): Pair<Int, Int> {
+    fun pagePdfSize(pageIndex: Int): Pair<Int, Int> = synchronized(lock) {
         val r = renderer ?: error("no document open")
         val page = r.openPage(pageIndex)
         try {
-            return page.width to page.height
+            return@synchronized page.width to page.height
         } finally {
             page.close()
         }
@@ -99,24 +107,37 @@ class PdfRenderer(private val context: android.content.Context) {
      *
      * Heavy — closes the AndroidPdfRenderer and reopens it. Call from a worker thread.
      */
-    fun extractTextRuns(pageIndex: Int): List<TextRun> {
+    fun extractTextRuns(pageIndex: Int): List<TextRun> = synchronized(lock) {
         val file = sourceFile ?: error("no document open")
         val wasOpen = renderer != null
-        if (wasOpen) close()
-        return try {
+        if (wasOpen) closeLocked()
+        return@synchronized try {
             PDDocument.load(file).use { doc ->
-                val pageHeight = doc.getPage(pageIndex).mediaBox.height
+                val pageObj = doc.getPage(pageIndex)
+                val mediaH = pageObj.mediaBox.height
+                val cropBox = pageObj.cropBox
+                val cropX0 = cropBox.lowerLeftX
+                val cropY0 = cropBox.lowerLeftY
+                val cropW = cropBox.width
+                val cropH = cropBox.height
                 val collected = mutableListOf<TextRun>()
                 val stripper = object : PDFTextStripper() {
                     override fun writeString(text: String, textPositions: List<TextPosition>) {
                         val trimmed = text.trim()
                         if (trimmed.isEmpty() || textPositions.isEmpty()) return
-                        val xMin = textPositions.minOf { it.x }
-                        val xMax = textPositions.maxOf { it.x + it.width }
+                        // PDFTextStripper reports text positions in MediaBox-relative
+                        // user space. The rendered bitmap is the CropBox, so translate.
+                        val xMinMedia = textPositions.minOf { it.x }
+                        val xMaxMedia = textPositions.maxOf { it.x + it.width }
                         val height = textPositions.maxOf { it.height }
-                        // PDFTextStripper Y is the baseline in top-down orientation.
-                        val baselineTopDown = textPositions.first().y
-                        val baselinePdf = pageHeight - baselineTopDown
+                        val baselineTopDownMedia = textPositions.first().y
+                        val baselineBottomUpMedia = mediaH - baselineTopDownMedia
+                        val xMin = xMinMedia - cropX0
+                        val xMax = xMaxMedia - cropX0
+                        val baselinePdf = baselineBottomUpMedia - cropY0
+                        // Drop runs entirely outside the visible CropBox.
+                        if (xMax < 0 || xMin > cropW) return
+                        if (baselinePdf < -height || baselinePdf > cropH + height) return
                         val first = textPositions.first()
                         collected += TextRun(
                             pageIndex = pageIndex,
@@ -134,13 +155,37 @@ class PdfRenderer(private val context: android.content.Context) {
                 stripper.startPage = pageIndex + 1
                 stripper.endPage = pageIndex + 1
                 stripper.getText(doc)
-                collected
+                // Dedupe by position: replaceText() leaves the original text in the
+                // content stream (just covered by a whiteout) so PDFTextStripper sees
+                // BOTH the original and our Helvetica overlay. The overlay is appended
+                // later in the stream, so it comes second in `collected`. Walk forward
+                // and drop any earlier run whose bbox overlaps the new one by >50%.
+                dedupeOverlappingRuns(collected)
             }
         } catch (_: Exception) {
             emptyList()
         } finally {
-            if (wasOpen) open(file)
+            if (wasOpen) openLocked(file)
         }
+    }
+
+    private fun dedupeOverlappingRuns(runs: List<TextRun>): List<TextRun> {
+        val out = mutableListOf<TextRun>()
+        for (r in runs) {
+            out.removeAll { e ->
+                val xOverlap = (minOf(e.x + e.width, r.x + r.width) - maxOf(e.x, r.x))
+                    .coerceAtLeast(0f)
+                val eTop = e.baselineY + e.height
+                val rTop = r.baselineY + r.height
+                val yOverlap = (minOf(eTop, rTop) - maxOf(e.baselineY, r.baselineY))
+                    .coerceAtLeast(0f)
+                val overlap = xOverlap * yOverlap
+                val area = (e.width * e.height).coerceAtLeast(1f)
+                overlap / area > 0.5f
+            }
+            out.add(r)
+        }
+        return out
     }
 
     /**
@@ -151,13 +196,35 @@ class PdfRenderer(private val context: android.content.Context) {
      * Alpha caveats: white fill (visible on non-white backgrounds), Helvetica
      * regardless of original font, single line.
      */
-    fun replaceText(run: TextRun, newText: String) {
+    /**
+     * Thrown when [newText] contains characters Helvetica can't represent. Surfaces
+     * to the UI so we can prompt the user to drop a Unicode font (v0.4.1 work).
+     */
+    class UnsupportedCharsException(val unsupported: List<Char>) : Exception(
+        "Helvetica can't encode these characters: ${unsupported.joinToString("") { it.toString() }}"
+    )
+
+    fun replaceText(run: TextRun, newText: String): Unit = synchronized(lock) {
+        // Refuse the edit if Helvetica can't represent any character.
+        val unsupported = newText.filter { !isWinAnsiChar(it) }.toSet().toList()
+        if (unsupported.isNotEmpty()) throw UnsupportedCharsException(unsupported)
+
         val file = sourceFile ?: error("no document open")
         val wasOpen = renderer != null
-        if (wasOpen) close()
+        if (wasOpen) closeLocked()
         try {
             PDDocument.load(file).use { doc ->
                 val page = doc.getPage(run.pageIndex)
+                // TextRun coords are CropBox-relative (matches what we display). PdfBox
+                // writes in MediaBox coords, so add the CropBox lower-left back.
+                val crop = page.cropBox
+                val mediaX = run.x + crop.lowerLeftX
+                val mediaBaseline = run.baselineY + crop.lowerLeftY
+                // Use a full visual line-height rect so ascenders and descenders are
+                // both covered (tp.height is just cap-height, leaks text on both ends).
+                val whiteoutAscent = run.fontSize * 0.95f
+                val whiteoutDescent = run.fontSize * 0.30f
+                val pad = 1.5f
                 PDPageContentStream(
                     doc,
                     page,
@@ -166,26 +233,50 @@ class PdfRenderer(private val context: android.content.Context) {
                     true
                 ).use { cs ->
                     cs.setNonStrokingColor(1f, 1f, 1f)
-                    val pad = 1.5f
                     cs.addRect(
-                        run.x - pad,
-                        run.baselineY - pad,
+                        mediaX - pad,
+                        mediaBaseline - whiteoutDescent - pad,
                         run.width + 2 * pad,
-                        run.height + 2 * pad
+                        whiteoutAscent + whiteoutDescent + 2 * pad
                     )
                     cs.fill()
                     cs.beginText()
                     cs.setNonStrokingColor(0f, 0f, 0f)
-                    cs.setFont(PDType1Font.HELVETICA, run.fontSize)
-                    cs.newLineAtOffset(run.x, run.baselineY)
+                    // Calibrate Helvetica's point size so its cap height matches the
+                    // original glyph height. PDFTextStripper's TextPosition.height is
+                    // roughly the original font's cap height; Helvetica's cap height
+                    // is ~0.72 of its point size. Falls back to fontSize if height
+                    // looks broken.
+                    val calibrated =
+                        if (run.height in 1f..200f) (run.height / 0.72f).coerceIn(4f, 200f)
+                        else run.fontSize
+                    cs.setFont(PDType1Font.HELVETICA, calibrated)
+                    cs.newLineAtOffset(mediaX, mediaBaseline)
                     cs.showText(newText)
                     cs.endText()
                 }
                 doc.save(file)
             }
+        } catch (e: Exception) {
+            Log.e("PdfEdit", "replaceText failed (page=${run.pageIndex}, text=\"$newText\")", e)
+            throw e
         } finally {
-            if (wasOpen) open(file)
+            if (wasOpen) openLocked(file)
         }
+    }
+
+    private fun isWinAnsiChar(ch: Char): Boolean = when (ch.code) {
+        in 0x20..0x7E,                    // printable ASCII
+        in 0xA0..0xFF,                    // Latin-1 supplement
+        0x2018, 0x2019,                   // ‘ ’
+        0x201C, 0x201D,                   // “ ”
+        0x2013, 0x2014,                   // – —
+        0x2022,                           // •
+        0x2026,                           // …
+        0x20AC,                           // €
+        0x009                             // tab — we'll render as space
+        -> true
+        else -> false
     }
 
     /**
@@ -198,13 +289,17 @@ class PdfRenderer(private val context: android.content.Context) {
         strokesPdf: List<List<FloatArray>>,
         rgb: Triple<Float, Float, Float> = Triple(0f, 0f, 0f),
         lineWidth: Float = 2f
-    ) {
+    ): Unit = synchronized(lock) {
         val file = sourceFile ?: error("no document open")
         val wasOpen = renderer != null
-        if (wasOpen) close()
+        if (wasOpen) closeLocked()
         try {
             PDDocument.load(file).use { doc ->
                 val page = doc.getPage(pageIndex)
+                // Strokes arrive in CropBox-relative coords; PdfBox needs MediaBox coords.
+                val crop = page.cropBox
+                val dx = crop.lowerLeftX
+                val dy = crop.lowerLeftY
                 PDPageContentStream(
                     doc,
                     page,
@@ -219,9 +314,9 @@ class PdfRenderer(private val context: android.content.Context) {
                     for (stroke in strokesPdf) {
                         if (stroke.size < 1) continue
                         val first = stroke[0]
-                        cs.moveTo(first[0], first[1])
+                        cs.moveTo(first[0] + dx, first[1] + dy)
                         for (i in 1 until stroke.size) {
-                            cs.lineTo(stroke[i][0], stroke[i][1])
+                            cs.lineTo(stroke[i][0] + dx, stroke[i][1] + dy)
                         }
                         cs.stroke()
                     }
@@ -229,7 +324,7 @@ class PdfRenderer(private val context: android.content.Context) {
                 doc.save(file)
             }
         } finally {
-            if (wasOpen) open(file)
+            if (wasOpen) openLocked(file)
         }
     }
 
@@ -273,7 +368,22 @@ class PdfRenderer(private val context: android.content.Context) {
         return if (pn >= 0) pn else 0
     }
 
-    fun close() {
+    fun close() = synchronized(lock) {
+        closeLocked()
+        sourceFile = null
+    }
+
+    /** Open under an already-held [lock]. Used by internal close+write+reopen pairs. */
+    private fun openLocked(file: File) {
+        closeLocked()
+        val fd = ParcelFileDescriptor.open(file, ParcelFileDescriptor.MODE_READ_ONLY)
+        pfd = fd
+        renderer = AndroidPdfRenderer(fd)
+        sourceFile = file
+    }
+
+    /** Tear down the AndroidPdfRenderer + FD but keep [sourceFile] so reopen still knows the path. */
+    private fun closeLocked() {
         try {
             renderer?.close()
         } catch (_: Exception) {
@@ -284,7 +394,6 @@ class PdfRenderer(private val context: android.content.Context) {
         } catch (_: Exception) {
         }
         pfd = null
-        sourceFile = null
         bookmarksCache = emptyList()
     }
 }
