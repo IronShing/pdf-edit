@@ -15,6 +15,7 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.ArrowBack
@@ -81,6 +82,9 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     var drawTarget by remember { mutableStateOf<Int?>(null) }
     val drawSession = remember { DrawSession() }
     var saving by remember { mutableStateOf(false) }
+    /** zoom scale per page; lifted up so back-handler and re-render can react */
+    val pageScales = remember { mutableStateMapOf<Int, Float>() }
+    val pageOffsets = remember { mutableStateMapOf<Int, Offset>() }
 
     DisposableEffect(file) {
         try {
@@ -106,6 +110,21 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     val currentPage by remember {
         derivedStateOf {
             (listState.firstVisibleItemIndex + 1).coerceAtMost(pageCount.coerceAtLeast(1))
+        }
+    }
+
+    BackHandler(enabled = !saving) {
+        val visible = listState.firstVisibleItemIndex
+        when {
+            drawTarget != null -> {
+                drawSession.clear()
+                drawTarget = null
+            }
+            (pageScales[visible] ?: 1f) > 1f -> {
+                pageScales[visible] = 1f
+                pageOffsets[visible] = Offset.Zero
+            }
+            else -> onClose()
         }
     }
 
@@ -240,6 +259,10 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                                 renderEpoch = renderEpoch,
                                 drawing = drawTarget == pageIndex,
                                 drawSession = drawSession,
+                                scale = pageScales[pageIndex] ?: 1f,
+                                offset = pageOffsets[pageIndex] ?: Offset.Zero,
+                                onScaleChange = { pageScales[pageIndex] = it },
+                                onOffsetChange = { pageOffsets[pageIndex] = it },
                                 onRendered = { size -> renderedSizes[pageIndex] = size }
                             )
                         }
@@ -338,14 +361,34 @@ private fun PageView(
     renderEpoch: Int,
     drawing: Boolean,
     drawSession: DrawSession,
+    scale: Float,
+    offset: Offset,
+    onScaleChange: (Float) -> Unit,
+    onOffsetChange: (Offset) -> Unit,
     onRendered: (IntSize) -> Unit
 ) {
-    var bitmap by remember(pageIndex, widthPx, rotation, renderEpoch) {
+    /** integer render quality tier: 1, 2, or 4 — re-rendered at widthPx × quality on zoom settle */
+    var renderQuality by remember(pageIndex) { mutableStateOf(1) }
+    var bitmap by remember(pageIndex, widthPx, rotation, renderEpoch, renderQuality) {
         mutableStateOf<Bitmap?>(null)
     }
 
-    LaunchedEffect(pageIndex, widthPx, rotation, renderEpoch) {
-        bitmap = withContext(Dispatchers.IO) { renderer.renderPage(pageIndex, widthPx, rotation) }
+    LaunchedEffect(pageIndex, widthPx, rotation, renderEpoch, renderQuality) {
+        bitmap = withContext(Dispatchers.IO) {
+            renderer.renderPage(pageIndex, widthPx * renderQuality, rotation)
+        }
+    }
+
+    // Settle the zoom level then bump render quality to the nearest integer step.
+    // Debounce so we don't re-render on every pinch frame.
+    LaunchedEffect(scale, pageIndex) {
+        kotlinx.coroutines.delay(180)
+        val target = when {
+            scale <= 1.25f -> 1
+            scale <= 2.5f -> 2
+            else -> 4
+        }
+        if (target != renderQuality) renderQuality = target
     }
 
     val bmp = bitmap
@@ -359,12 +402,11 @@ private fun PageView(
             CircularProgressIndicator(modifier = Modifier.padding(32.dp))
         }
     } else {
-        LaunchedEffect(bmp.width, bmp.height) {
-            onRendered(IntSize(bmp.width, bmp.height))
+        LaunchedEffect(bmp.width, bmp.height, renderQuality) {
+            // report the displayed bitmap size in pixels at quality=1 so PDF-coord transforms stay
+            // consistent regardless of current render quality
+            onRendered(IntSize(bmp.width / renderQuality, bmp.height / renderQuality))
         }
-        var scale by remember(pageIndex) { mutableStateOf(1f) }
-        var offsetX by remember(pageIndex) { mutableStateOf(0f) }
-        var offsetY by remember(pageIndex) { mutableStateOf(0f) }
 
         Box(modifier = Modifier.fillMaxWidth()) {
             Image(
@@ -375,8 +417,8 @@ private fun PageView(
                     .graphicsLayer(
                         scaleX = scale,
                         scaleY = scale,
-                        translationX = offsetX,
-                        translationY = offsetY
+                        translationX = offset.x,
+                        translationY = offset.y
                     )
                     .then(
                         if (drawing) Modifier
@@ -391,22 +433,19 @@ private fun PageView(
                                             val zoomChange = event.calculateZoom()
                                             val panChange = event.calculatePan()
                                             if (zoomChange != 1f) {
-                                                scale = (scale * zoomChange).coerceIn(1f, 6f)
-                                                if (scale == 1f) {
-                                                    offsetX = 0f; offsetY = 0f
-                                                }
+                                                val newScale = (scale * zoomChange).coerceIn(1f, 6f)
+                                                onScaleChange(newScale)
+                                                if (newScale == 1f) onOffsetChange(Offset.Zero)
                                             }
                                             if (scale > 1f && panChange != Offset.Zero) {
-                                                offsetX += panChange.x
-                                                offsetY += panChange.y
+                                                onOffsetChange(offset + panChange)
                                             }
                                             event.changes.forEach { if (it.positionChanged()) it.consume() }
                                         }
                                         pressed == 1 && scale > 1f -> {
                                             val panChange = event.calculatePan()
                                             if (panChange != Offset.Zero) {
-                                                offsetX += panChange.x
-                                                offsetY += panChange.y
+                                                onOffsetChange(offset + panChange)
                                                 event.changes.forEach { if (it.positionChanged()) it.consume() }
                                             }
                                         }
