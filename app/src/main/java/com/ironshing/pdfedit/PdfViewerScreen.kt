@@ -24,12 +24,19 @@ import androidx.compose.material.icons.automirrored.filled.RotateRight
 import androidx.compose.material.icons.filled.Check
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.Draw
+import androidx.compose.material.icons.filled.TextFields
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.offset
+import androidx.compose.foundation.layout.size
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
@@ -85,6 +92,12 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     /** zoom scale per page; lifted up so back-handler and re-render can react */
     val pageScales = remember { mutableStateMapOf<Int, Float>() }
     val pageOffsets = remember { mutableStateMapOf<Int, Offset>() }
+    /** text-edit mode: which page (null = view), runs found on it, currently selected run */
+    var textEditTarget by remember { mutableStateOf<Int?>(null) }
+    var textRuns by remember { mutableStateOf<List<TextRun>>(emptyList()) }
+    var pagePdfSize by remember { mutableStateOf<Pair<Int, Int>?>(null) }
+    var editingRun by remember { mutableStateOf<TextRun?>(null) }
+    var editingDraft by remember { mutableStateOf("") }
 
     DisposableEffect(file) {
         try {
@@ -116,6 +129,14 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     BackHandler(enabled = !saving) {
         val visible = listState.firstVisibleItemIndex
         when {
+            editingRun != null -> {
+                editingRun = null
+                editingDraft = ""
+            }
+            textEditTarget != null -> {
+                textEditTarget = null
+                textRuns = emptyList()
+            }
             drawTarget != null -> {
                 drawSession.clear()
                 drawTarget = null
@@ -128,14 +149,42 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
         }
     }
 
+    // When the user enters text-edit mode (or after a save) extract runs from disk.
+    LaunchedEffect(textEditTarget, renderEpoch) {
+        val target = textEditTarget
+        if (target == null) {
+            textRuns = emptyList()
+            pagePdfSize = null
+        } else {
+            val pair = withContext(Dispatchers.IO) {
+                runCatching {
+                    val size = renderer.pagePdfSize(target)
+                    val runs = renderer.extractTextRuns(target)
+                    size to runs
+                }.getOrNull()
+            }
+            if (pair != null) {
+                pagePdfSize = pair.first
+                textRuns = pair.second
+            } else {
+                textRuns = emptyList()
+                pagePdfSize = null
+            }
+        }
+    }
+
     Scaffold(
         topBar = {
             TopAppBar(
                 title = {
                     Text(
                         text = if (pageCount > 0) {
-                            val mode = if (drawTarget != null) "draw" else "view"
-                            "${file.nameWithoutExtension.take(20)}  ·  $currentPage / $pageCount  ·  $mode"
+                            val mode = when {
+                                drawTarget != null -> "draw"
+                                textEditTarget != null -> "edit text"
+                                else -> "view"
+                            }
+                            "${file.nameWithoutExtension.take(18)}  ·  $currentPage / $pageCount  ·  $mode"
                         } else {
                             file.nameWithoutExtension.take(30)
                         }
@@ -147,7 +196,7 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                     }
                 },
                 actions = {
-                    if (drawTarget == null) {
+                    if (drawTarget == null && textEditTarget == null) {
                         IconButton(onClick = { bookmarksOpen = true }) {
                             Icon(Icons.AutoMirrored.Filled.MenuBook, contentDescription = "Bookmarks")
                         }
@@ -163,6 +212,18 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                             drawTarget = listState.firstVisibleItemIndex
                         }) {
                             Icon(Icons.Default.Draw, contentDescription = "Draw on this page")
+                        }
+                        IconButton(onClick = {
+                            textEditTarget = listState.firstVisibleItemIndex
+                        }) {
+                            Icon(Icons.Default.TextFields, contentDescription = "Edit text on this page")
+                        }
+                    } else if (textEditTarget != null) {
+                        IconButton(onClick = {
+                            textEditTarget = null
+                            textRuns = emptyList()
+                        }, enabled = !saving) {
+                            Icon(Icons.Default.Close, contentDescription = "Exit text-edit")
                         }
                     } else {
                         IconButton(
@@ -245,12 +306,13 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                             .background(Color(0xFF0A0A0A)),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                         contentPadding = PaddingValues(8.dp),
-                        userScrollEnabled = drawTarget == null
+                        userScrollEnabled = drawTarget == null && textEditTarget == null
                     ) {
                         items(
                             items = (0 until pageCount).toList(),
                             key = { it }
                         ) { pageIndex ->
+                            val isTextTarget = textEditTarget == pageIndex
                             PageView(
                                 renderer = renderer,
                                 pageIndex = pageIndex,
@@ -259,10 +321,17 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                                 renderEpoch = renderEpoch,
                                 drawing = drawTarget == pageIndex,
                                 drawSession = drawSession,
-                                scale = pageScales[pageIndex] ?: 1f,
-                                offset = pageOffsets[pageIndex] ?: Offset.Zero,
+                                scale = if (isTextTarget) 1f else (pageScales[pageIndex] ?: 1f),
+                                offset = if (isTextTarget) Offset.Zero else (pageOffsets[pageIndex] ?: Offset.Zero),
                                 onScaleChange = { pageScales[pageIndex] = it },
                                 onOffsetChange = { pageOffsets[pageIndex] = it },
+                                textEditing = isTextTarget,
+                                textRuns = if (isTextTarget) textRuns else emptyList(),
+                                pagePdfSize = if (isTextTarget) pagePdfSize else null,
+                                onRunTap = { run ->
+                                    editingRun = run
+                                    editingDraft = run.text
+                                },
                                 onRendered = { size -> renderedSizes[pageIndex] = size }
                             )
                         }
@@ -296,6 +365,35 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
                 }
             }
         }
+    }
+
+    val activeRun = editingRun
+    if (activeRun != null) {
+        TextEditDialog(
+            original = activeRun,
+            draft = editingDraft,
+            onDraftChange = { editingDraft = it },
+            onCancel = {
+                editingRun = null
+                editingDraft = ""
+            },
+            onConfirm = {
+                val pending = activeRun
+                val pendingDraft = editingDraft
+                saving = true
+                editingRun = null
+                scope.launch {
+                    val outcome = withContext(Dispatchers.IO) {
+                        runCatching { renderer.replaceText(pending, pendingDraft) }
+                    }
+                    outcome.onFailure { error = it.message }
+                    editingDraft = ""
+                    saving = false
+                    renderEpoch++
+                }
+            },
+            saving = saving
+        )
     }
 
     if (bookmarksOpen) {
@@ -347,6 +445,53 @@ fun PdfViewerScreen(file: File, onClose: () -> Unit) {
     }
 }
 
+@Composable
+private fun TextEditDialog(
+    original: TextRun,
+    draft: String,
+    onDraftChange: (String) -> Unit,
+    onCancel: () -> Unit,
+    onConfirm: () -> Unit,
+    saving: Boolean
+) {
+    AlertDialog(
+        onDismissRequest = { if (!saving) onCancel() },
+        title = { Text("Edit text") },
+        text = {
+            androidx.compose.foundation.layout.Column {
+                Text(
+                    text = "Original: ${original.text}",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(8.dp))
+                OutlinedTextField(
+                    value = draft,
+                    onValueChange = onDraftChange,
+                    modifier = Modifier.fillMaxWidth(),
+                    enabled = !saving,
+                    singleLine = true
+                )
+                androidx.compose.foundation.layout.Spacer(modifier = Modifier.size(8.dp))
+                Text(
+                    text = "Font: ${original.fontName} · ${"%.1f".format(original.fontSize)}pt\n" +
+                            "Alpha caveat: new text is drawn in Helvetica over a white rectangle.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = onConfirm, enabled = !saving && draft.isNotEmpty()) {
+                Text(if (saving) "Saving..." else "Save")
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onCancel, enabled = !saving) { Text("Cancel") }
+        }
+    )
+}
+
 private data class FlatBookmark(val bookmark: PdfBookmark, val depth: Int)
 
 private fun List<PdfBookmark>.flatten(depth: Int = 0): List<FlatBookmark> =
@@ -365,6 +510,10 @@ private fun PageView(
     offset: Offset,
     onScaleChange: (Float) -> Unit,
     onOffsetChange: (Offset) -> Unit,
+    textEditing: Boolean,
+    textRuns: List<TextRun>,
+    pagePdfSize: Pair<Int, Int>?,
+    onRunTap: (TextRun) -> Unit,
     onRendered: (IntSize) -> Unit
 ) {
     /** integer render quality tier: 1, 2, or 4 — re-rendered at widthPx × quality on zoom settle */
@@ -421,7 +570,7 @@ private fun PageView(
                         translationY = offset.y
                     )
                     .then(
-                        if (drawing) Modifier
+                        if (drawing || textEditing) Modifier
                         else Modifier.pointerInput(pageIndex) {
                             awaitEachGesture {
                                 awaitFirstDown(requireUnconsumed = false)
@@ -460,6 +609,34 @@ private fun PageView(
                     session = drawSession,
                     modifier = Modifier.matchParentSize()
                 )
+            }
+            if (textEditing && pagePdfSize != null && textRuns.isNotEmpty()) {
+                val density = LocalDensity.current
+                val bmpWidthPx = bmp.width / renderQuality
+                val bmpHeightPx = bmp.height / renderQuality
+                val (pdfW, pdfH) = pagePdfSize
+                val sx = bmpWidthPx.toFloat() / pdfW
+                val sy = bmpHeightPx.toFloat() / pdfH
+                for (run in textRuns) {
+                    val leftPx = run.x * sx
+                    val topPx = (pdfH - run.baselineY - run.height) * sy
+                    val widthPxRun = run.width * sx
+                    val heightPxRun = run.height * sy
+                    Box(
+                        modifier = Modifier
+                            .offset(
+                                x = with(density) { leftPx.toDp() },
+                                y = with(density) { topPx.toDp() }
+                            )
+                            .size(
+                                width = with(density) { widthPxRun.toDp() },
+                                height = with(density) { heightPxRun.toDp() }
+                            )
+                            .border(1.dp, Color(0x9900AAFF))
+                            .background(Color(0x3300AAFF))
+                            .clickable { onRunTap(run) }
+                    )
+                }
             }
         }
     }

@@ -8,10 +8,13 @@ import android.os.ParcelFileDescriptor
 import com.tom_roush.pdfbox.android.PDFBoxResourceLoader
 import com.tom_roush.pdfbox.pdmodel.PDDocument
 import com.tom_roush.pdfbox.pdmodel.PDPageContentStream
+import com.tom_roush.pdfbox.pdmodel.font.PDType1Font
 import com.tom_roush.pdfbox.pdmodel.interactive.action.PDActionGoTo
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.destination.PDPageDestination
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDDocumentOutline
 import com.tom_roush.pdfbox.pdmodel.interactive.documentnavigation.outline.PDOutlineItem
+import com.tom_roush.pdfbox.text.PDFTextStripper
+import com.tom_roush.pdfbox.text.TextPosition
 import java.io.File
 
 data class PdfBookmark(
@@ -86,6 +89,102 @@ class PdfRenderer(private val context: android.content.Context) {
             return page.width to page.height
         } finally {
             page.close()
+        }
+    }
+
+    /**
+     * Extract text runs on [pageIndex] (one run per line/string as emitted by PdfBox's
+     * PDFTextStripper). Returns runs with PDF-native (bottom-up) coordinates so they
+     * can be both displayed as overlays *and* written back into the content stream.
+     *
+     * Heavy — closes the AndroidPdfRenderer and reopens it. Call from a worker thread.
+     */
+    fun extractTextRuns(pageIndex: Int): List<TextRun> {
+        val file = sourceFile ?: error("no document open")
+        val wasOpen = renderer != null
+        if (wasOpen) close()
+        return try {
+            PDDocument.load(file).use { doc ->
+                val pageHeight = doc.getPage(pageIndex).mediaBox.height
+                val collected = mutableListOf<TextRun>()
+                val stripper = object : PDFTextStripper() {
+                    override fun writeString(text: String, textPositions: List<TextPosition>) {
+                        val trimmed = text.trim()
+                        if (trimmed.isEmpty() || textPositions.isEmpty()) return
+                        val xMin = textPositions.minOf { it.x }
+                        val xMax = textPositions.maxOf { it.x + it.width }
+                        val height = textPositions.maxOf { it.height }
+                        // PDFTextStripper Y is the baseline in top-down orientation.
+                        val baselineTopDown = textPositions.first().y
+                        val baselinePdf = pageHeight - baselineTopDown
+                        val first = textPositions.first()
+                        collected += TextRun(
+                            pageIndex = pageIndex,
+                            text = text,
+                            x = xMin,
+                            y = baselinePdf,
+                            width = xMax - xMin,
+                            height = height,
+                            baselineY = baselinePdf,
+                            fontName = first.font.name ?: "Unknown",
+                            fontSize = first.fontSizeInPt
+                        )
+                    }
+                }
+                stripper.startPage = pageIndex + 1
+                stripper.endPage = pageIndex + 1
+                stripper.getText(doc)
+                collected
+            }
+        } catch (_: Exception) {
+            emptyList()
+        } finally {
+            if (wasOpen) open(file)
+        }
+    }
+
+    /**
+     * Replace [run]'s text with [newText] by drawing a white rectangle over the
+     * original bbox and rendering [newText] in Helvetica at the original baseline
+     * and size. Heavy — closes / reopens the renderer.
+     *
+     * Alpha caveats: white fill (visible on non-white backgrounds), Helvetica
+     * regardless of original font, single line.
+     */
+    fun replaceText(run: TextRun, newText: String) {
+        val file = sourceFile ?: error("no document open")
+        val wasOpen = renderer != null
+        if (wasOpen) close()
+        try {
+            PDDocument.load(file).use { doc ->
+                val page = doc.getPage(run.pageIndex)
+                PDPageContentStream(
+                    doc,
+                    page,
+                    PDPageContentStream.AppendMode.APPEND,
+                    true,
+                    true
+                ).use { cs ->
+                    cs.setNonStrokingColor(1f, 1f, 1f)
+                    val pad = 1.5f
+                    cs.addRect(
+                        run.x - pad,
+                        run.baselineY - pad,
+                        run.width + 2 * pad,
+                        run.height + 2 * pad
+                    )
+                    cs.fill()
+                    cs.beginText()
+                    cs.setNonStrokingColor(0f, 0f, 0f)
+                    cs.setFont(PDType1Font.HELVETICA, run.fontSize)
+                    cs.newLineAtOffset(run.x, run.baselineY)
+                    cs.showText(newText)
+                    cs.endText()
+                }
+                doc.save(file)
+            }
+        } finally {
+            if (wasOpen) open(file)
         }
     }
 

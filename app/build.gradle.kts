@@ -12,8 +12,8 @@ android {
         applicationId = "com.ironshing.pdfedit"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "0.2.0"
+        versionCode = 4
+        versionName = "0.4.0-alpha"
 
         ndk {
             abiFilters.addAll(listOf("armeabi-v7a", "arm64-v8a", "x86", "x86_64"))
